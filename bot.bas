@@ -72,15 +72,6 @@ Sub ShowStatus(ByVal robot As Any Ptr, ByRef text As Const String, ByVal value A
     CyCheck(robot, cy_status_text(robot, StrPtr(text), Len(text)))
     If withValue Then CyCheck(robot, cy_status_value(robot, value))
 End Sub
-' The arena's calibration kernel, xorshift-sqrt v1; safe to delete.
-Function CalibrationWork(ByVal work As Long, ByVal tick As Long) As Double
-    Dim x As ULongInt = 88172645463325252ull Xor CULngInt(tick), total As Double = 0
-    For i As Long = 1 To work
-        x Xor= x Shl 13: x Xor= x Shr 7: x Xor= x Shl 17
-        total += Sqr(CDbl(x Shr 11))
-    Next
-    Return (CULngInt(Int(total)) + (x Shr 40)) Mod 1000000
-End Function
 Sub Start(ByVal robot As Any Ptr)
     Dim gravity As CyVec3, is3d As Long
     CyCheck(robot, cy_arena_gravity(robot, @gravity))
@@ -145,11 +136,6 @@ Sub Turn(ByVal robot As Any Ptr)
             CyCheck(robot, cy_angles_bearing_to(@position, @zone.center_value, @bearing))
             Drive(robot, 0.8, Steer(bearing, heading, 30), Clamp((climb - pitch) / 30))
         End If
-    End If
-    ' Only the arena's rate calibration sends this; safe to delete.
-    Dim work As Double
-    If cy_raw_number(robot, "state.calibration.work", 22, @work) = CY_OK Then
-        If work >= 1 AndAlso work = Int(work) Then ShowStatus(robot, "WORK", CalibrationWork(work, tick))
     End If
 End Sub
 CyRun(@Turn, @Start)
