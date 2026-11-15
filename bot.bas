@@ -7,7 +7,8 @@
 ' clock: tick seconds remaining_ticks
 ' arena: size gravity terrain_kind ground_height(x y)
 ' me: health position velocity heading pitch roll angular_velocity
-'   attitude grounded altitude applied
+'   attitude grounded altitude applied hull_mounts to_mount(heading pitch)
+'   from_mount(heading pitch) mount_toward(point)
 ' battery: charge capacity regen sustainable_drive compute
 '   drive_cost(fraction)
 ' drive: hover_lift
@@ -29,7 +30,8 @@
 ' score: me best armour
 ' angles: normalize(degrees) angle_diff(target current)
 '   bearing_to(from to) elevation_to(from to) direction(heading pitch)
-'   distance(a b) clamp(value low high)
+'   distance(a b) to_chassis(heading pitch attitude)
+'   from_chassis(heading pitch attitude) clamp(value low high)
 ' raw: number(path) text(path) has(path) flag(path) count(path) line()
 ' Controls: drive.set(throttle turn pitch_turn)
 '   drive.forces(thrust strafe lift yaw_torque pitch_torque roll_torque brake)
@@ -43,6 +45,7 @@
 ' Manual: https://clunkyard.com/manual#sdk
 #include once "clunkyard.bi"
 Dim Shared freeFlight As Boolean
+Dim Shared As Long dodgeTicks, dodges
 Function Number(ByVal robot As Any Ptr, ByVal query As Function Cdecl(ByVal As Any Ptr, ByVal As Double Ptr) As Long) As Double
     Dim value As Double
     CyCheck(robot, query(robot, @value))
@@ -90,6 +93,7 @@ Sub Turn(ByVal robot As Any Ptr)
         Drive(robot, throttle, Steer(target.bearing_value, heading), Steer(target.elevation_value, pitch))
         Scan(robot, target.bearing_value, 20, target.elevation_value)
         Dim power As Double, aim As CySolution, nowAim As CyDirection, delta As Double, canFire As Long
+        ' cy_gun_lead is the intercept if the target holds course.
         CyCheck(robot, cy_gun_power_for_flight_time(robot, target.range_value, 1, @power))
         If cy_gun_lead(robot, @target, power, @aim) <> CY_OK Then
             aim.heading_value = target.bearing_value: aim.pitch_value = target.elevation_value
@@ -120,6 +124,28 @@ Sub Turn(ByVal robot As Any Ptr)
         Drive(robot, 0.5, 0.33, Steer(0, pitch))
         Scan(robot, sweep, 40, IIf(freeFlight, ((tick \ 10) Mod 3 - 1) * 35, 0))
         ShowStatus(robot, "SEARCH", 0, False)
+    End If
+    ' A simple dodge: vary it, or predict the shooter.
+    Dim cues(0 To 31) As CyContact, heard As ULong, fired As Boolean = False
+    If cy_sensors_cues(robot, @cues(0), 32, @heard) = CY_OK Then
+        For i As Integer = 0 To CInt(heard) - 1
+            If cues(i).source_value = CY_SOURCE_MUZZLE Then fired = True
+        Next
+    End If
+    If dodgeTicks = 0 AndAlso fired Then dodges += 1: dodgeTicks = 10
+    If dodgeTicks > 0 Then
+        ' Odd dodges go left, even ones right; turn +1 and strafe -1 go left.
+        Dim leftward As Boolean = (dodges Mod 2 = 1), side As Double = IIf(leftward, 1.0, -1.0), control As Long
+        CyCheck(robot, cy_match_control(robot, @control))
+        dodgeTicks -= 1
+        If control = CY_CONTROL_FORCES Then
+            CyCheck(robot, cy_drive_throttle(robot, 0.5))
+            CyCheck(robot, cy_drive_strafe(robot, -side))
+        Else
+            CyCheck(robot, cy_drive_throttle(robot, 1))
+            CyCheck(robot, cy_drive_turn(robot, side))
+        End If
+        ShowStatus(robot, IIf(leftward, "dodge:left", "dodge:right"), dodges)
     End If
     If Number(robot, @cy_battery_charge) < Number(robot, @cy_battery_capacity) / 4 Then CyCheck(robot, cy_drive_throttle(robot, Number(robot, @cy_drive_get_throttle) * 0.5))
     Dim storm As CyStorm, zone As CyZone, margin As Double, bearing As Double, climb As Double
