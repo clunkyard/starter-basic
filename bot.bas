@@ -45,7 +45,18 @@
 ' Manual: https://clunkyard.com/manual#sdk
 #include once "clunkyard.bi"
 Dim Shared freeFlight As Boolean
-Dim Shared As Long dodgeTicks, dodges
+Dim Shared As Long dodgeTicks, dodges, slot
+' Bearing is earned: a scan contact's bearing is off by up to its bearing error
+' (degrees, a fixed share of the arc), so a wide beam finds a robot and a narrow
+' one aims at it. Contacts within 120 units are exact.
+Const SEARCH_ARC = 40  ' degrees: sweeps the circle in half a second
+Const HOLD_WIDTH = 60  ' units across at the target: it stays in the beam from tick to tick
+Const MIN_ARC = 6      ' degrees: the narrowest the beam holds
+Const AVERAGE_TICKS = 12      ' ticks of sightings the aim averages
+Const SIGHTINGS = 8    ' narrow sightings in the window before a shot
+Const LOOK_EVERY = 40  ' ticks between looks around the target, for a nearer robot
+Const REACQUIRE = 10   ' ticks to look again where a lost target was
+Const PI = 3.14159265358979
 Function Number(ByVal robot As Any Ptr, ByVal query As Function Cdecl(ByVal As Any Ptr, ByVal As Double Ptr) As Long) As Double
     Dim value As Double
     CyCheck(robot, query(robot, @value))
@@ -75,6 +86,44 @@ Sub ShowStatus(ByVal robot As Any Ptr, ByRef text As Const String, ByVal value A
     CyCheck(robot, cy_status_text(robot, StrPtr(text), Len(text)))
     If withValue Then CyCheck(robot, cy_status_value(robot, value))
 End Sub
+' A straight line through the narrowest of the last AVERAGE_TICKS ticks of sightings: where
+' the robot is now and how fast it moves. Each sighting is off by its bearing error;
+' the line averages that out. Returns the sightings it used, 0 for no fit.
+Function Fit(ByVal robot As Any Ptr, ByVal target As Long, ByVal tick As Long, ByRef where As CyVec3, ByRef speed As CyVec3) As Long
+    Dim history(0 To 31) As CySighting, total As ULong, rate As Long
+    If cy_tracker_history(robot, target, @history(0), 32, @total) <> CY_OK Then Return 0
+    CyCheck(robot, cy_match_tick_rate(robot, @rate))
+    Dim best As Double = 1e30, seen(0 To 31) As Long, n As Long = 0
+    For i As Integer = 0 To CInt(total) - 1
+        If history(i).tick_value > tick - AVERAGE_TICKS AndAlso history(i).bearing_error_value < best Then best = history(i).bearing_error_value
+    Next
+    For i As Integer = 0 To CInt(total) - 1
+        If history(i).tick_value > tick - AVERAGE_TICKS AndAlso history(i).bearing_error_value <= 1.5 * best Then seen(n) = i: n += 1
+    Next
+    If n < 2 Then Return 0
+    Dim t0 As Double = 0, spread As Double = 0
+    For k As Integer = 0 To n - 1: t0 += history(seen(k)).tick_value: Next
+    t0 /= n
+    For k As Integer = 0 To n - 1: spread += (history(seen(k)).tick_value - t0) ^ 2: Next
+    Dim p(0 To 2) As Double, v(0 To 2) As Double
+    For axis As Integer = 0 To 2
+        Dim mean As Double = 0, slope As Double = 0
+        For k As Integer = 0 To n - 1
+            Dim s As CySighting = history(seen(k))
+            mean += IIf(axis = 0, s.position_value.x_value, IIf(axis = 1, s.position_value.y_value, s.position_value.z_value))
+        Next
+        mean /= n
+        For k As Integer = 0 To n - 1
+            Dim s As CySighting = history(seen(k))
+            slope += (s.tick_value - t0) * (IIf(axis = 0, s.position_value.x_value, IIf(axis = 1, s.position_value.y_value, s.position_value.z_value)) - mean)
+        Next
+        slope /= spread
+        p(axis) = mean + slope * (tick - t0): v(axis) = slope * rate
+    Next
+    where.x_value = p(0): where.y_value = p(1): where.z_value = p(2)
+    speed.x_value = v(0): speed.y_value = v(1): speed.z_value = v(2)
+    Return n
+End Function
 Sub Start(ByVal robot As Any Ptr)
     Dim gravity As CyVec3, is3d As Long
     CyCheck(robot, cy_arena_gravity(robot, @gravity))
@@ -82,7 +131,7 @@ Sub Start(ByVal robot As Any Ptr)
     freeFlight = is3d <> 0 AndAlso gravity.z_value = 0
 End Sub
 Sub Turn(ByVal robot As Any Ptr)
-    Dim position As CyVec3, target As CyContact, cue As CyCue, lastScan As CyScan, tick As Long
+    Dim position As CyVec3, target As CyContact, cue As CyCue, lastScan As CyScan, tick As Long, seen As Long
     CyCheck(robot, cy_me_position(robot, @position))
     CyCheck(robot, cy_scanner_last(robot, @lastScan))
     CyCheck(robot, cy_clock_tick(robot, @tick))
@@ -91,22 +140,48 @@ Sub Turn(ByVal robot As Any Ptr)
     If cy_sensors_nearest(robot, @target) = CY_OK Then
         Dim throttle As Double = IIf(target.range_value > 350, 0.7, IIf(target.range_value < 200, -0.4, 0.2))
         Drive(robot, throttle, Steer(target.bearing_value, heading), Steer(target.elevation_value, pitch))
-        Scan(robot, target.bearing_value, 20, target.elevation_value)
+        slot = target.slot_value
+        ' Halve the beam each tick until it is HOLD_WIDTH across at the target:
+        ' narrow enough for a precise bearing, wide enough to keep it in.
+        Dim hold As Double = 2 * Atan2(HOLD_WIDTH / 2, target.range_value) * 180 / PI
+        If hold < MIN_ARC Then hold = MIN_ARC
+        ' In a crowd a narrow beam sees one robot: every LOOK_EVERY ticks, widen it for a tick.
+        Dim halved As Double = lastScan.arc_value / 2
+        If halved > SEARCH_ARC Then halved = SEARCH_ARC
+        Dim beam As Double = IIf(halved > hold, halved, hold)
+        Scan(robot, target.bearing_value, IIf(tick Mod LOOK_EVERY = 0, SEARCH_ARC, beam), target.elevation_value)
         Dim power As Double, aim As CySolution, nowAim As CyDirection, delta As Double, canFire As Long
-        ' cy_gun_lead is the intercept if the target holds course.
+        Dim where As CyVec3, speed As CyVec3, used As Long = 0, ready As Boolean = True, led As Boolean
         CyCheck(robot, cy_gun_power_for_flight_time(robot, target.range_value, 1, @power))
-        If cy_gun_lead(robot, @target, power, @aim) <> CY_OK Then
-            aim.heading_value = target.bearing_value: aim.pitch_value = target.elevation_value
+        If target.bearing_error_value > 0 Then
+            ' A noisy contact: lead the fitted line, and fire only once it rests on enough sightings.
+            used = Fit(robot, slot, tick, where, speed)
+            led = used > 0 AndAlso cy_gun_lead_point(robot, @where, @speed, power, @aim) = CY_OK
+            ready = led AndAlso used >= SIGHTINGS
+        Else
+            ' An exact contact: cy_gun_lead is the intercept if the target holds course.
+            led = cy_gun_lead(robot, @target, power, @aim) = CY_OK
         End If
+        If Not led Then aim.heading_value = target.bearing_value: aim.pitch_value = target.elevation_value
         CyCheck(robot, cy_gun_aim_heading(robot, aim.heading_value))
         CyCheck(robot, cy_gun_aim_pitch(robot, aim.pitch_value))
         CyCheck(robot, cy_gun_aim_now(robot, @nowAim))
         CyCheck(robot, cy_angles_angle_diff(aim.heading_value, nowAim.heading_value, @delta))
         CyCheck(robot, cy_gun_can_fire(robot, power, 10, @canFire))
-        If Abs(delta) < 3 AndAlso Abs(aim.pitch_value - nowAim.pitch_value) < 3 AndAlso canFire <> 0 Then
+        If ready AndAlso Abs(delta) < 3 AndAlso Abs(aim.pitch_value - nowAim.pitch_value) < 3 AndAlso canFire <> 0 Then
             CyCheck(robot, cy_gun_fire(robot)): CyCheck(robot, cy_gun_power(robot, power))
         End If
-        ShowStatus(robot, "TRACK", target.range_value)
+        ShowStatus(robot, IIf(ready, "TRACK", "NARROW"), target.range_value)
+    ElseIf slot <> 0 AndAlso cy_tracker_last_seen(robot, slot, @seen) = CY_OK AndAlso tick - seen <= REACQUIRE Then
+        ' Lost it: look again where it was last seen, widening the beam, before searching.
+        Dim where As CyVec3, bearing As Double, elevation As Double = 0, arc As Double = lastScan.arc_value * 2
+        CyCheck(robot, cy_tracker_position(robot, slot, @where))
+        CyCheck(robot, cy_angles_bearing_to(@position, @where, @bearing))
+        If freeFlight Then CyCheck(robot, cy_angles_elevation_to(@position, @where, @elevation))
+        If arc > SEARCH_ARC Then arc = SEARCH_ARC
+        Drive(robot, 0.5, Steer(bearing, heading), Steer(elevation, pitch))
+        Scan(robot, bearing, arc, elevation)
+        ShowStatus(robot, "REACQUIRE", 0, False)
     ElseIf cy_tracker_cue(robot, @cue) = CY_OK Then
         Dim bearing As Double, distance As Double, elevation As Double = 0, arc As Double
         CyCheck(robot, cy_angles_bearing_to(@position, @cue.position_value, @bearing))
